@@ -1701,7 +1701,8 @@ def render_live_terminal():
         scan_count=st.session_state.scan_count,
         is_running=st.session_state.running,
     )
-    st.markdown(html_out, unsafe_allow_html=True)
+    clean_html = "\n".join(line.lstrip() for line in html_out.splitlines())
+    st.markdown(clean_html, unsafe_allow_html=True)
 
 
 render_live_terminal()
