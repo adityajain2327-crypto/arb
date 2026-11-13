@@ -1,6 +1,3 @@
-﻿# Install required libraries
-
-
 import time
 import logging
 import threading
@@ -9,53 +6,50 @@ import requests
 import pyotp
 import numpy as np
 import pandas as pd
-import ipywidgets as widgets
+import streamlit as st
 from datetime import datetime, timedelta, timezone
-from IPython.display import display, Javascript
-from google.colab import output
 from SmartApi import SmartConnect
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 warnings.filterwarnings("ignore")
 logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
-# ==============================================================================
-# 0. CLEANUP ANY PREVIOUS RUNS IN THIS COLAB KERNEL
-# ==============================================================================
-if "SCANNER_CONTROL" in globals() and isinstance(SCANNER_CONTROL, dict):
-    SCANNER_CONTROL["alive"] = False
-    SCANNER_CONTROL["running"] = False
-
-if "ACTIVE_WS_CLIENT" in globals() and ACTIVE_WS_CLIENT is not None:
-    try:
-        ACTIVE_WS_CLIENT.close_connection()
-    except Exception:
-        pass
+st.set_page_config(
+    page_title="Quant OTM Arbitrage Terminal",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 # ==============================================================================
-# 1. AUTHENTICATION VIA GOOGLE COLAB SECRETS
+# 1. AUTHENTICATION VIA STREAMLIT SECRETS
 # ==============================================================================
 try:
-    from google.colab import userdata
-    API_KEY     = userdata.get("ANGEL_API_KEY")
-    CLIENT_CODE = userdata.get("ANGEL_CLIENT_CODE")
-    MPIN        = userdata.get("ANGEL_PASSWORD")
-    TOTP_SECRET = userdata.get("ANGEL_TOTP_SECRET")
+    API_KEY = st.secrets["ANGEL_API_KEY"]
+    CLIENT_CODE = st.secrets["ANGEL_CLIENT_CODE"]
+    MPIN = st.secrets["ANGEL_PASSWORD"]
+    TOTP_SECRET = st.secrets["ANGEL_TOTP_SECRET"]
 except Exception:
-    raise RuntimeError("Could not read Colab Secrets. Ensure ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PASSWORD, and ANGEL_TOTP_SECRET are saved with Notebook access ON.")
+    st.error(
+        "Missing Angel One credentials. Go to Streamlit Cloud -> Manage app -> Settings -> Secrets "
+        "and add ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PASSWORD, and ANGEL_TOTP_SECRET."
+    )
+    st.stop()
+
 
 def authenticate_angel_one():
     smart_api = SmartConnect(api_key=API_KEY)
     clean_totp = str(TOTP_SECRET).strip().replace(" ", "").upper()
     totp_now = pyotp.TOTP(clean_totp).now()
-    
+
     session = smart_api.generateSession(str(CLIENT_CODE), str(MPIN), totp_now)
     if not session.get("status"):
         raise RuntimeError(f"Angel One Login Failed: {session}")
-    
+
     jwt_token = session["data"]["jwtToken"]
     feed_token = smart_api.getfeedToken()
     return smart_api, jwt_token, feed_token
+
 
 # ==============================================================================
 # 2. COMMODITY CONFIGURATION & SCRIP MASTER LOADER
@@ -66,134 +60,175 @@ COMMODITY_CONFIGS = {
         "mega": "NATURALGAS",
         "mini": "NATGASMINI",
         "has_mini": True,
-        "label": "MCX NATURAL GAS"
+        "label": "MCX NATURAL GAS",
     },
     "MCX Crude Oil (Crude + Crude Mini)": {
         "exch_seg": "MCX",
         "mega": "CRUDEOIL",
         "mini": "CRUDEOILM",
         "has_mini": True,
-        "label": "MCX CRUDE OIL"
+        "label": "MCX CRUDE OIL",
     },
     "MCX Gold (Gold + Gold Mini)": {
         "exch_seg": "MCX",
         "mega": "GOLD",
         "mini": "GOLDM",
         "has_mini": True,
-        "label": "MCX GOLD"
+        "label": "MCX GOLD",
     },
     "MCX Silver (Silver + Silver Mini)": {
         "exch_seg": "MCX",
         "mega": "SILVER",
         "mini": "SILVERM",
         "has_mini": True,
-        "label": "MCX SILVER"
+        "label": "MCX SILVER",
     },
     "NSE Crude Oil (Vertical Only)": {
         "exch_seg": "NCO",
         "mega": "CRUDEOIL",
         "mini": None,
         "has_mini": False,
-        "label": "NSE CRUDE OIL (NCO)"
-    }
+        "label": "NSE CRUDE OIL (NCO)",
+    },
 }
 
+
+@st.cache_data(ttl=3600, show_spinner="Downloading Angel One Scrip Master...")
 def download_scrip_master() -> pd.DataFrame:
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     scrip_data = requests.get(url, timeout=30).json()
     df_master = pd.DataFrame(scrip_data)
-    df_master["expiry_dt"] = pd.to_datetime(df_master["expiry"], format="%d%b%Y", errors="coerce")
+    df_master["expiry_dt"] = pd.to_datetime(
+        df_master["expiry"], format="%d%b%Y", errors="coerce"
+    )
     return df_master
 
-def extract_contracts_for_selection(df_master: pd.DataFrame, smart_api: SmartConnect, config: dict):
+
+def extract_contracts_for_selection(
+    df_master: pd.DataFrame, smart_api: SmartConnect, config: dict
+):
     exch = config["exch_seg"]
     mega_name = config["mega"]
     mini_name = config["mini"]
     target_names = [mega_name] + ([mini_name] if mini_name else [])
-    
+
     today = pd.Timestamp.now().normalize()
     df_sub = df_master[
-        (df_master["exch_seg"] == exch) &
-        (df_master["name"].isin(target_names)) &
-        (df_master["expiry_dt"] >= today)
+        (df_master["exch_seg"] == exch)
+        & (df_master["name"].isin(target_names))
+        & (df_master["expiry_dt"] >= today)
     ].copy()
-    
+
     if df_sub.empty:
-        raise ValueError(f"No active contracts found for {config['label']} on {exch}.")
-    
-    # 1. Nearest active Underlying Future for Spot reference
+        raise ValueError(
+            f"No active contracts found for {config['label']} on {exch}."
+        )
+
     df_fut = df_sub[
-        (df_sub["name"] == mega_name) &
-        (df_sub["instrumenttype"].str.startswith("FUT", na=False))
+        (df_sub["name"] == mega_name)
+        & (df_sub["instrumenttype"].str.startswith("FUT", na=False))
     ].sort_values("expiry_dt")
-    
+
     if df_fut.empty:
-        raise ValueError(f"No active Future contract found for {mega_name} on {exch}.")
-        
+        raise ValueError(
+            f"No active Future contract found for {mega_name} on {exch}."
+        )
+
     nearest_fut = df_fut.iloc[0]
     fut_token = str(nearest_fut["token"])
     fut_symbol = str(nearest_fut["symbol"])
-    
+
     fut_resp = smart_api.ltpData(exch, fut_symbol, fut_token)
-    fut_ltp = float(fut_resp["data"]["ltp"]) if (fut_resp and fut_resp.get("status")) else 0.0
-    
-    # 2. Option contracts (align common expiry between Mega & Mini when available)
+    fut_ltp = (
+        float(fut_resp["data"]["ltp"])
+        if (fut_resp and fut_resp.get("status"))
+        else 0.0
+    )
+
     df_opt_all = df_sub[
-        (df_sub["instrumenttype"].str.startswith("OPT", na=False)) &
-        (df_sub["symbol"].str.endswith(("CE", "PE"), na=False))
+        (df_sub["instrumenttype"].str.startswith("OPT", na=False))
+        & (df_sub["symbol"].str.endswith(("CE", "PE"), na=False))
     ].copy()
-    
+
     mega_opt = df_opt_all[df_opt_all["name"] == mega_name].copy()
-    mini_opt = df_opt_all[df_opt_all["name"] == mini_name].copy() if mini_name else pd.DataFrame()
-    
+    mini_opt = (
+        df_opt_all[df_opt_all["name"] == mini_name].copy()
+        if mini_name
+        else pd.DataFrame()
+    )
+
     chain_parts = []
     expiry_labels = []
-    
+
     if not mini_opt.empty and not mega_opt.empty:
-        common_expiries = sorted(list(set(mega_opt["expiry_dt"].dropna()) & set(mini_opt["expiry_dt"].dropna())))
+        common_expiries = sorted(
+            list(
+                set(mega_opt["expiry_dt"].dropna())
+                & set(mini_opt["expiry_dt"].dropna())
+            )
+        )
         if common_expiries:
             chosen_exp = common_expiries[0]
             chain_parts.append(mega_opt[mega_opt["expiry_dt"] == chosen_exp])
             chain_parts.append(mini_opt[mini_opt["expiry_dt"] == chosen_exp])
-            expiry_labels.append(f"Matched Expiry: {chosen_exp.strftime('%d-%b-%Y')}")
+            expiry_labels.append(
+                f"Matched Expiry: {chosen_exp.strftime('%d-%b-%Y')}"
+            )
         else:
             m_exp = mega_opt["expiry_dt"].min()
             s_exp = mini_opt["expiry_dt"].min()
             chain_parts.append(mega_opt[mega_opt["expiry_dt"] == m_exp])
             chain_parts.append(mini_opt[mini_opt["expiry_dt"] == s_exp])
-            expiry_labels.append(f"{mega_name}: {m_exp.strftime('%d-%b-%Y')} | {mini_name}: {s_exp.strftime('%d-%b-%Y')}")
+            expiry_labels.append(
+                f"{mega_name}: {m_exp.strftime('%d-%b-%Y')} | {mini_name}: {s_exp.strftime('%d-%b-%Y')}"
+            )
     elif not mega_opt.empty:
         m_exp = mega_opt["expiry_dt"].min()
         chain_parts.append(mega_opt[mega_opt["expiry_dt"] == m_exp])
         expiry_labels.append(f"Expiry: {m_exp.strftime('%d-%b-%Y')}")
-        
+
     if not chain_parts:
         raise ValueError(f"No active option chains found for {config['label']}.")
-        
+
     df_full_chain = pd.concat(chain_parts, ignore_index=True)
     df_full_chain["strike"] = df_full_chain["strike"].astype(float) / 100.0
     df_full_chain["opt_type"] = df_full_chain["symbol"].str[-2:]
     df_full_chain["lotsize"] = df_full_chain["lotsize"].astype(int)
     df_full_chain["token"] = df_full_chain["token"].astype(str)
-    df_full_chain = df_full_chain.sort_values(["name", "strike", "opt_type"]).reset_index(drop=True)
-    
-    # Keep closest 200 contracts around spot for 1-second depth sync; any deeper pinned strike is injected dynamically
+    df_full_chain = df_full_chain.sort_values(
+        ["name", "strike", "opt_type"]
+    ).reset_index(drop=True)
+
     df_active = df_full_chain.copy()
     if fut_ltp > 0 and len(df_active) > 200:
         df_active["dist"] = (df_active["strike"] - fut_ltp).abs()
         df_active = df_active.sort_values("dist").head(200).drop(columns=["dist"])
-    df_active = df_active.sort_values(["name", "strike", "opt_type"]).reset_index(drop=True)
-    
-    mega_lot = int(df_full_chain[df_full_chain["name"] == mega_name]["lotsize"].iloc[0]) if (df_full_chain["name"] == mega_name).any() else 1
-    mini_lot = int(df_full_chain[df_full_chain["name"] == mini_name]["lotsize"].iloc[0]) if (mini_name and (df_full_chain["name"] == mini_name).any()) else 1
-    
+    df_active = df_active.sort_values(
+        ["name", "strike", "opt_type"]
+    ).reset_index(drop=True)
+
+    mega_lot = (
+        int(df_full_chain[df_full_chain["name"] == mega_name]["lotsize"].iloc[0])
+        if (df_full_chain["name"] == mega_name).any()
+        else 1
+    )
+    mini_lot = (
+        int(df_full_chain[df_full_chain["name"] == mini_name]["lotsize"].iloc[0])
+        if (mini_name and (df_full_chain["name"] == mini_name).any())
+        else 1
+    )
+
     ratio_str = "Single Contract"
-    if mini_name and (df_full_chain["name"] == mega_name).any() and (df_full_chain["name"] == mini_name).any():
+    if (
+        mini_name
+        and (df_full_chain["name"] == mega_name).any()
+        and (df_full_chain["name"] == mini_name).any()
+    ):
         if mini_lot > 0 and mega_lot >= mini_lot:
             ratio_str = f"1 {mega_name} : {mega_lot // mini_lot} {mini_name}"
-            
+
     available_strikes = sorted([float(s) for s in df_full_chain["strike"].unique()])
-    
+
     meta = {
         "exch_seg": exch,
         "fut_token": fut_token,
@@ -206,12 +241,18 @@ def extract_contracts_for_selection(df_master: pd.DataFrame, smart_api: SmartCon
         "has_mini": config["has_mini"],
         "label": config["label"],
         "available_strikes": available_strikes,
-        "df_all_strikes": df_full_chain[["token", "symbol", "name", "strike", "opt_type", "lotsize"]].copy()
+        "df_all_strikes": df_full_chain[
+            ["token", "symbol", "name", "strike", "opt_type", "lotsize"]
+        ].copy(),
     }
-    return df_active[["token", "symbol", "name", "strike", "opt_type", "lotsize"]], meta
+    return (
+        df_active[["token", "symbol", "name", "strike", "opt_type", "lotsize"]],
+        meta,
+    )
+
 
 # ==============================================================================
-# 3. REAL-TIME ENGINE WITH TOP-5 ORDER BOOK DEPTH STORAGE (CROSS & VERTICAL)
+# 3. REAL-TIME ENGINE WITH TOP-5 ORDER BOOK DEPTH STORAGE
 # ==============================================================================
 def _normalize_depth_levels(raw_levels: list, scale_paise: bool = False) -> list:
     levels = []
@@ -223,17 +264,20 @@ def _normalize_depth_levels(raw_levels: list, scale_paise: bool = False) -> list
             qty = int(lvl.get("quantity", 0))
             orders = int(lvl.get("no_of_orders", lvl.get("orders", 0)))
             if px > 0 or qty > 0:
-                levels.append({"price": round(px, 2), "qty": qty, "orders": orders})
+                levels.append(
+                    {"price": round(px, 2), "qty": qty, "orders": orders}
+                )
     while len(levels) < 5:
         levels.append({"price": 0.0, "qty": 0, "orders": 0})
     return levels
+
 
 class QuantOTMArbitrageEngine:
     def __init__(self, smart_api: SmartConnect, jwt_token: str, feed_token: str):
         self.smart_api = smart_api
         self.jwt_token = jwt_token
         self.feed_token = feed_token
-        
+
         self.lock = threading.Lock()
         self.state = {}
         self.fut_ltp = 0.0
@@ -245,6 +289,8 @@ class QuantOTMArbitrageEngine:
         self.rest_sync_count = 0
         self.peak_custom_spreads = {}
         self.sws = None
+        self.alive = True
+        self.running = True
 
     def _empty_token_state(self) -> dict:
         return {
@@ -252,24 +298,28 @@ class QuantOTMArbitrageEngine:
             "bid": 0.0,
             "ask": 0.0,
             "depth_buy": _normalize_depth_levels([]),
-            "depth_sell": _normalize_depth_levels([])
+            "depth_sell": _normalize_depth_levels([]),
         }
 
     def start_websocket(self):
-        global ACTIVE_WS_CLIENT
-        self.sws = SmartWebSocketV2(self.jwt_token, API_KEY, CLIENT_CODE, self.feed_token)
+        self.sws = SmartWebSocketV2(
+            self.jwt_token, API_KEY, CLIENT_CODE, self.feed_token
+        )
         self.sws.MAX_RETRY_ATTEMPT = 1
-        ACTIVE_WS_CLIENT = self.sws
-        
+
         def on_data(wsapp, message):
             tok = str(message.get("token", ""))
             ltp = float(message.get("last_traded_price", 0.0)) / 100.0
-            buy_5 = _normalize_depth_levels(message.get("best_5_buy_data", []), scale_paise=True)
-            sell_5 = _normalize_depth_levels(message.get("best_5_sell_data", []), scale_paise=True)
-            
+            buy_5 = _normalize_depth_levels(
+                message.get("best_5_buy_data", []), scale_paise=True
+            )
+            sell_5 = _normalize_depth_levels(
+                message.get("best_5_sell_data", []), scale_paise=True
+            )
+
             best_bid = buy_5[0]["price"]
             best_ask = sell_5[0]["price"]
-            
+
             with self.lock:
                 self.ws_tick_count += 1
                 if tok == self.meta.get("fut_token") and ltp > 0:
@@ -300,16 +350,30 @@ class QuantOTMArbitrageEngine:
         self.sws.on_data = on_data
         self.sws._on_close = safe_close
         self.sws._on_error = safe_error
-        
+
         threading.Thread(target=self.sws.connect, daemon=True).start()
+
+    def start_rest_worker(self):
+        def worker():
+            while self.alive:
+                if self.running:
+                    try:
+                        self.sync_full_depth_snapshot()
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _subscribe_in_chunks(self, tokens: list, chunk_size: int = 100):
         if not self.sws or not self.ws_connected or not tokens:
             return
         for i in range(0, len(tokens), chunk_size):
-            batch = tokens[i:i + chunk_size]
+            batch = tokens[i : i + chunk_size]
             try:
-                self.sws.subscribe("qotmarb01", 3, [{"exchangeType": 5, "tokens": batch}])
+                self.sws.subscribe(
+                    "qotmarb01", 3, [{"exchangeType": 5, "tokens": batch}]
+                )
             except Exception:
                 pass
 
@@ -317,19 +381,21 @@ class QuantOTMArbitrageEngine:
         if not self.sws or not self.ws_connected or not tokens:
             return
         for i in range(0, len(tokens), chunk_size):
-            batch = tokens[i:i + chunk_size]
+            batch = tokens[i : i + chunk_size]
             try:
-                self.sws.unsubscribe("qotmarb01", 3, [{"exchangeType": 5, "tokens": batch}])
+                self.sws.unsubscribe(
+                    "qotmarb01", 3, [{"exchangeType": 5, "tokens": batch}]
+                )
             except Exception:
                 pass
 
     def switch_contracts(self, df_contracts: pd.DataFrame, meta: dict):
         new_tokens = [meta["fut_token"]] + df_contracts["token"].tolist()
-        
+
         with self.lock:
             old_tokens = list(self.subscribed_mcx_tokens)
             old_exch = self.meta.get("exch_seg", "MCX")
-            
+
             self.df_contracts = df_contracts.copy()
             self.meta = meta.copy()
             self.fut_ltp = meta["init_spot"]
@@ -340,13 +406,15 @@ class QuantOTMArbitrageEngine:
                 str(row["token"]): self._empty_token_state()
                 for _, row in df_contracts.iterrows()
             }
-            self.subscribed_mcx_tokens = new_tokens if meta["exch_seg"] == "MCX" else []
+            self.subscribed_mcx_tokens = (
+                new_tokens if meta["exch_seg"] == "MCX" else []
+            )
 
         if old_exch == "MCX" and old_tokens:
             self._unsubscribe_in_chunks(old_tokens)
-            
+
         self.sync_full_depth_snapshot()
-        
+
         if meta["exch_seg"] == "MCX" and new_tokens:
             self._subscribe_in_chunks(new_tokens)
 
@@ -357,10 +425,16 @@ class QuantOTMArbitrageEngine:
             if ((self.df_contracts["strike"] - strike_val).abs() < 1e-4).any():
                 return True
             df_all = self.meta["df_all_strikes"]
-            matches = df_all[(df_all["strike"] - strike_val).abs() < 1e-4].copy()
+            matches = df_all[
+                (df_all["strike"] - strike_val).abs() < 1e-4
+            ].copy()
             if matches.empty:
                 return False
-            self.df_contracts = pd.concat([self.df_contracts, matches], ignore_index=True).drop_duplicates(subset=["token"]).reset_index(drop=True)
+            self.df_contracts = (
+                pd.concat([self.df_contracts, matches], ignore_index=True)
+                .drop_duplicates(subset=["token"])
+                .reset_index(drop=True)
+            )
             new_toks = []
             for _, row in matches.iterrows():
                 tok = str(row["token"])
@@ -384,7 +458,7 @@ class QuantOTMArbitrageEngine:
 
         chunk_size = 50
         for i in range(0, len(all_tokens), chunk_size):
-            batch = all_tokens[i:i + chunk_size]
+            batch = all_tokens[i : i + chunk_size]
             try:
                 resp = self.smart_api.getMarketData("FULL", {exch: batch})
                 if resp and resp.get("status") and "data" in resp:
@@ -400,8 +474,12 @@ class QuantOTMArbitrageEngine:
                                     self.fut_ltp = ltp
                                 continue
                             depth = item.get("depth", {})
-                            buy_5 = _normalize_depth_levels(depth.get("buy", []), scale_paise=False)
-                            sell_5 = _normalize_depth_levels(depth.get("sell", []), scale_paise=False)
+                            buy_5 = _normalize_depth_levels(
+                                depth.get("buy", []), scale_paise=False
+                            )
+                            sell_5 = _normalize_depth_levels(
+                                depth.get("sell", []), scale_paise=False
+                            )
                             if tok in self.state:
                                 if ltp > 0:
                                     self.state[tok]["ltp"] = ltp
@@ -413,17 +491,21 @@ class QuantOTMArbitrageEngine:
                 pass
             if i + chunk_size < len(all_tokens):
                 time.sleep(0.15)
-                
+
         with self.lock:
             self.rest_sync_count += 1
 
-    def _inspect_pinned_item(self, spec: str, df_all: pd.DataFrame, state_map: dict, current_spot: float, meta: dict) -> dict:
+    def _inspect_pinned_item(
+        self,
+        spec: str,
+        df_all: pd.DataFrame,
+        state_map: dict,
+        current_spot: float,
+        meta: dict,
+    ) -> dict:
         parts = spec.split("|")
         kind = parts[0]
 
-        # ----------------------------------------------------------------------
-        # CASE 1: CROSS-CONTRACT PIN (Mega vs Mini on Exact Same OTM Strike)
-        # ----------------------------------------------------------------------
         if kind == "CROSS" and len(parts) >= 2:
             strike_val = float(parts[1])
             mega_name = meta.get("mega", "")
@@ -432,7 +514,13 @@ class QuantOTMArbitrageEngine:
 
             sub = df_all[(df_all["strike"] - strike_val).abs() < 1e-4]
             if sub.empty:
-                return {"spec": spec, "kind": "CROSS", "strike": strike_val, "status": "NOT_FOUND", "otm_type": "CE"}
+                return {
+                    "spec": spec,
+                    "kind": "CROSS",
+                    "strike": strike_val,
+                    "status": "NOT_FOUND",
+                    "otm_type": "CE",
+                }
 
             if current_spot > 0:
                 if strike_val > current_spot:
@@ -440,24 +528,63 @@ class QuantOTMArbitrageEngine:
                 elif strike_val < current_spot:
                     otm_type = "PE"
                 else:
-                    return {"spec": spec, "kind": "CROSS", "strike": strike_val, "status": "ATM_FILTERED", "spot": current_spot, "otm_type": "CE"}
+                    return {
+                        "spec": spec,
+                        "kind": "CROSS",
+                        "strike": strike_val,
+                        "status": "ATM_FILTERED",
+                        "spot": current_spot,
+                        "otm_type": "CE",
+                    }
             else:
                 otm_type = "CE"
 
             opt_df = sub[sub["opt_type"] == otm_type]
-            m_row = opt_df[opt_df["name"] == mega_name].iloc[0] if not opt_df[opt_df["name"] == mega_name].empty else None
-            s_row = opt_df[opt_df["name"] == mini_name].iloc[0] if (has_mini and not opt_df[opt_df["name"] == mini_name].empty) else None
+            m_row = (
+                opt_df[opt_df["name"] == mega_name].iloc[0]
+                if not opt_df[opt_df["name"] == mega_name].empty
+                else None
+            )
+            s_row = (
+                opt_df[opt_df["name"] == mini_name].iloc[0]
+                if (has_mini and not opt_df[opt_df["name"] == mini_name].empty)
+                else None
+            )
 
-            m_st = state_map.get(str(m_row["token"]), self._empty_token_state()) if m_row is not None else self._empty_token_state()
-            s_st = state_map.get(str(s_row["token"]), self._empty_token_state()) if s_row is not None else self._empty_token_state()
+            m_st = (
+                state_map.get(str(m_row["token"]), self._empty_token_state())
+                if m_row is not None
+                else self._empty_token_state()
+            )
+            s_st = (
+                state_map.get(str(s_row["token"]), self._empty_token_state())
+                if s_row is not None
+                else self._empty_token_state()
+            )
 
             m_bid, m_ask = m_st["bid"], m_st["ask"]
             s_bid, s_ask = s_st["bid"], s_st["ask"]
 
-            e1 = round(m_bid - s_ask, 2) if (has_mini and m_bid > 0 and s_ask > 0) else None
-            e2 = round(s_bid - m_ask, 2) if (has_mini and s_bid > 0 and m_ask > 0) else None
-            ask_diff = round(abs(m_ask - s_ask), 2) if (has_mini and m_ask > 0 and s_ask > 0) else None
-            bid_diff = round(abs(m_bid - s_bid), 2) if (has_mini and m_bid > 0 and s_bid > 0) else None
+            e1 = (
+                round(m_bid - s_ask, 2)
+                if (has_mini and m_bid > 0 and s_ask > 0)
+                else None
+            )
+            e2 = (
+                round(s_bid - m_ask, 2)
+                if (has_mini and s_bid > 0 and m_ask > 0)
+                else None
+            )
+            ask_diff = (
+                round(abs(m_ask - s_ask), 2)
+                if (has_mini and m_ask > 0 and s_ask > 0)
+                else None
+            )
+            bid_diff = (
+                round(abs(m_bid - s_bid), 2)
+                if (has_mini and m_bid > 0 and s_bid > 0)
+                else None
+            )
 
             best_exec = None
             best_dir = "Waiting for two-sided quotes"
@@ -483,19 +610,25 @@ class QuantOTMArbitrageEngine:
                 "has_mini": has_mini,
                 "mega_name": mega_name,
                 "mini_name": mini_name or "",
-                "m_bid": m_bid, "m_ask": m_ask, "m_ltp": m_st["ltp"],
-                "m_depth_buy": m_st["depth_buy"], "m_depth_sell": m_st["depth_sell"],
-                "s_bid": s_bid, "s_ask": s_ask, "s_ltp": s_st["ltp"],
-                "s_depth_buy": s_st["depth_buy"], "s_depth_sell": s_st["depth_sell"],
-                "e_mini_to_mega": e1, "e_mega_to_mini": e2,
-                "best_exec": best_exec, "best_dir": best_dir,
-                "ask_diff": ask_diff, "bid_diff": bid_diff,
-                "peak_val": peak_val
+                "m_bid": m_bid,
+                "m_ask": m_ask,
+                "m_ltp": m_st["ltp"],
+                "m_depth_buy": m_st["depth_buy"],
+                "m_depth_sell": m_st["depth_sell"],
+                "s_bid": s_bid,
+                "s_ask": s_ask,
+                "s_ltp": s_st["ltp"],
+                "s_depth_buy": s_st["depth_buy"],
+                "s_depth_sell": s_st["depth_sell"],
+                "e_mini_to_mega": e1,
+                "e_mega_to_mini": e2,
+                "best_exec": best_exec,
+                "best_dir": best_dir,
+                "ask_diff": ask_diff,
+                "bid_diff": bid_diff,
+                "peak_val": peak_val,
             }
 
-        # ----------------------------------------------------------------------
-        # CASE 2: VERTICAL PAIR PIN (Buy Strike vs Sell Strike in Same Contract)
-        # ----------------------------------------------------------------------
         if kind == "VERT" and len(parts) >= 5:
             contract_name = parts[1]
             buy_strike = float(parts[2])
@@ -503,27 +636,73 @@ class QuantOTMArbitrageEngine:
             opt_type = parts[4]
 
             if current_spot > 0:
-                if opt_type == "CE" and (buy_strike <= current_spot or sell_strike <= current_spot):
-                    return {"spec": spec, "kind": "VERT", "contract": contract_name, "buy_strike": buy_strike, "sell_strike": sell_strike, "opt_type": opt_type, "otm_type": opt_type, "status": "ITM_FILTERED", "spot": current_spot}
-                if opt_type == "PE" and (buy_strike >= current_spot or sell_strike >= current_spot):
-                    return {"spec": spec, "kind": "VERT", "contract": contract_name, "buy_strike": buy_strike, "sell_strike": sell_strike, "opt_type": opt_type, "otm_type": opt_type, "status": "ITM_FILTERED", "spot": current_spot}
+                if opt_type == "CE" and (
+                    buy_strike <= current_spot or sell_strike <= current_spot
+                ):
+                    return {
+                        "spec": spec,
+                        "kind": "VERT",
+                        "contract": contract_name,
+                        "buy_strike": buy_strike,
+                        "sell_strike": sell_strike,
+                        "opt_type": opt_type,
+                        "otm_type": opt_type,
+                        "status": "ITM_FILTERED",
+                        "spot": current_spot,
+                    }
+                if opt_type == "PE" and (
+                    buy_strike >= current_spot or sell_strike >= current_spot
+                ):
+                    return {
+                        "spec": spec,
+                        "kind": "VERT",
+                        "contract": contract_name,
+                        "buy_strike": buy_strike,
+                        "sell_strike": sell_strike,
+                        "opt_type": opt_type,
+                        "otm_type": opt_type,
+                        "status": "ITM_FILTERED",
+                        "spot": current_spot,
+                    }
 
-            c_df = df_all[(df_all["name"] == contract_name) & (df_all["opt_type"] == opt_type)]
+            c_df = df_all[
+                (df_all["name"] == contract_name)
+                & (df_all["opt_type"] == opt_type)
+            ]
             b_sub = c_df[(c_df["strike"] - buy_strike).abs() < 1e-4]
             s_sub = c_df[(c_df["strike"] - sell_strike).abs() < 1e-4]
 
             if b_sub.empty or s_sub.empty:
-                return {"spec": spec, "kind": "VERT", "contract": contract_name, "buy_strike": buy_strike, "sell_strike": sell_strike, "opt_type": opt_type, "otm_type": opt_type, "status": "NOT_FOUND"}
+                return {
+                    "spec": spec,
+                    "kind": "VERT",
+                    "contract": contract_name,
+                    "buy_strike": buy_strike,
+                    "sell_strike": sell_strike,
+                    "opt_type": opt_type,
+                    "otm_type": opt_type,
+                    "status": "NOT_FOUND",
+                }
 
-            b_st = state_map.get(str(b_sub.iloc[0]["token"]), self._empty_token_state())
-            s_st = state_map.get(str(s_sub.iloc[0]["token"]), self._empty_token_state())
+            b_st = state_map.get(
+                str(b_sub.iloc[0]["token"]), self._empty_token_state()
+            )
+            s_st = state_map.get(
+                str(s_sub.iloc[0]["token"]), self._empty_token_state()
+            )
 
             b_bid, b_ask = b_st["bid"], b_st["ask"]
             s_bid, s_ask = s_st["bid"], s_st["ask"]
 
-            exec_vert = round(s_bid - b_ask, 2) if (s_bid > 0 and b_ask > 0) else None
-            ask_inv = round(s_ask - b_ask, 2) if (s_ask > 0 and b_ask > 0) else None
-            bid_diff = round(s_bid - b_bid, 2) if (s_bid > 0 and b_bid > 0) else None
+            exec_vert = (
+                round(s_bid - b_ask, 2) if (s_bid > 0 and b_ask > 0) else None
+            )
+            ask_inv = (
+                round(s_ask - b_ask, 2) if (s_ask > 0 and b_ask > 0) else None
+            )
+            bid_diff = (
+                round(s_bid - b_bid, 2) if (s_bid > 0 and b_bid > 0) else None
+            )
 
             if exec_vert is not None:
                 prev_pk = self.peak_custom_spreads.get(spec)
@@ -531,7 +710,11 @@ class QuantOTMArbitrageEngine:
                     self.peak_custom_spreads[spec] = exec_vert
             peak_val = self.peak_custom_spreads.get(spec)
 
-            best_dir = f"Buy {buy_strike:g} @ ₹{b_ask:.2f} / Sell {sell_strike:g} @ ₹{s_bid:.2f}" if (b_ask > 0 and s_bid > 0) else "Waiting for two-sided quotes"
+            best_dir = (
+                f"Buy {buy_strike:g} @ ₹{b_ask:.2f} / Sell {sell_strike:g} @ ₹{s_bid:.2f}"
+                if (b_ask > 0 and s_bid > 0)
+                else "Waiting for two-sided quotes"
+            )
 
             return {
                 "spec": spec,
@@ -542,20 +725,37 @@ class QuantOTMArbitrageEngine:
                 "otm_type": opt_type,
                 "buy_strike": buy_strike,
                 "sell_strike": sell_strike,
-                "b_bid": b_bid, "b_ask": b_ask,
-                "b_depth_buy": b_st["depth_buy"], "b_depth_sell": b_st["depth_sell"],
-                "s_bid": s_bid, "s_ask": s_ask,
-                "s_depth_buy": s_st["depth_buy"], "s_depth_sell": s_st["depth_sell"],
+                "b_bid": b_bid,
+                "b_ask": b_ask,
+                "b_depth_buy": b_st["depth_buy"],
+                "b_depth_sell": b_st["depth_sell"],
+                "s_bid": s_bid,
+                "s_ask": s_ask,
+                "s_depth_buy": s_st["depth_buy"],
+                "s_depth_sell": s_st["depth_sell"],
                 "best_exec": exec_vert,
                 "best_dir": best_dir,
                 "ask_inv": ask_inv,
                 "bid_diff": bid_diff,
-                "peak_val": peak_val
+                "peak_val": peak_val,
             }
 
-        return {"spec": spec, "kind": "CROSS", "strike": 0, "status": "NOT_FOUND", "otm_type": "CE"}
+        return {
+            "spec": spec,
+            "kind": "CROSS",
+            "strike": 0,
+            "status": "NOT_FOUND",
+            "otm_type": "CE",
+        }
 
-    def run_otm_scan(self, min_spread: float, include_quoted: bool, arb_mode: str, contract_scope: str, pinned_specs: list):
+    def run_otm_scan(
+        self,
+        min_spread: float,
+        include_quoted: bool,
+        arb_mode: str,
+        contract_scope: str,
+        pinned_specs: list,
+    ):
         with self.lock:
             current_spot = self.fut_ltp
             meta_copy = self.meta.copy()
@@ -563,45 +763,56 @@ class QuantOTMArbitrageEngine:
             rest_syncs = self.rest_sync_count
             if self.df_contracts.empty:
                 return {}, 0.0, meta_copy, (0, 0, ws_ticks, rest_syncs)
-            
+
             total_contracts = len(self.df_contracts)
             active_quotes = 0
             state_snapshot = {}
             records = []
             for _, row in self.df_contracts.iterrows():
                 tok = str(row["token"])
-                st = self.state.get(tok, self._empty_token_state())
+                st_item = self.state.get(tok, self._empty_token_state())
                 state_snapshot[tok] = {
-                    "ltp": st["ltp"],
-                    "bid": st["bid"],
-                    "ask": st["ask"],
-                    "depth_buy": list(st["depth_buy"]),
-                    "depth_sell": list(st["depth_sell"])
+                    "ltp": st_item["ltp"],
+                    "bid": st_item["bid"],
+                    "ask": st_item["ask"],
+                    "depth_buy": list(st_item["depth_buy"]),
+                    "depth_sell": list(st_item["depth_sell"]),
                 }
-                if st["bid"] > 0 or st["ask"] > 0 or st["ltp"] > 0:
+                if (
+                    st_item["bid"] > 0
+                    or st_item["ask"] > 0
+                    or st_item["ltp"] > 0
+                ):
                     active_quotes += 1
-                records.append({
-                    "token": tok,
-                    "symbol": row["symbol"],
-                    "name": row["name"],
-                    "strike": float(row["strike"]),
-                    "opt_type": row["opt_type"],
-                    "bid": float(st["bid"]),
-                    "ask": float(st["ask"]),
-                    "ltp": float(st["ltp"])
-                })
+                records.append(
+                    {
+                        "token": tok,
+                        "symbol": row["symbol"],
+                        "name": row["name"],
+                        "strike": float(row["strike"]),
+                        "opt_type": row["opt_type"],
+                        "bid": float(st_item["bid"]),
+                        "ask": float(st_item["ask"]),
+                        "ltp": float(st_item["ltp"]),
+                    }
+                )
 
         df_all = pd.DataFrame(records)
+        pinned_cards = [
+            self._inspect_pinned_item(
+                sp, df_all, state_snapshot, current_spot, meta_copy
+            )
+            for sp in pinned_specs
+        ]
 
-        # 1. Inspect Custom Pinned Items (Cross Strikes & Vertical Strike Pairs — Strictly OTM Only)
-        pinned_cards = [self._inspect_pinned_item(sp, df_all, state_snapshot, current_spot, meta_copy) for sp in pinned_specs]
-
-        # 2. Strict OTM Filter for Scanner Tables
         df_otm = df_all.copy()
         if current_spot > 0:
             df_otm = df_otm[
-                ((df_otm["opt_type"] == "CE") & (df_otm["strike"] > current_spot)) |
-                ((df_otm["opt_type"] == "PE") & (df_otm["strike"] < current_spot))
+                ((df_otm["opt_type"] == "CE") & (df_otm["strike"] > current_spot))
+                | (
+                    (df_otm["opt_type"] == "PE")
+                    & (df_otm["strike"] < current_spot)
+                )
             ].copy()
 
         cross_ce, cross_pe, vert_ce, vert_pe = [], [], [], []
@@ -609,12 +820,16 @@ class QuantOTMArbitrageEngine:
         mega_name = meta_copy.get("mega", "")
         mini_name = meta_copy.get("mini", "")
 
-        # A. Cross-Contract OTM Arbitrage (Mega vs Mini on Exact Same Strike)
         if has_mini:
             mega_sub = df_otm[df_otm["name"] == mega_name]
             mini_sub = df_otm[df_otm["name"] == mini_name]
             if not mega_sub.empty and not mini_sub.empty:
-                merged = pd.merge(mega_sub, mini_sub, on=["strike", "opt_type"], suffixes=("_mega", "_mini"))
+                merged = pd.merge(
+                    mega_sub,
+                    mini_sub,
+                    on=["strike", "opt_type"],
+                    suffixes=("_mega", "_mini"),
+                )
                 for _, r in merged.iterrows():
                     opt = r["opt_type"]
                     k = float(r["strike"])
@@ -629,7 +844,7 @@ class QuantOTMArbitrageEngine:
                                 "Strategy": f"Buy {mini_name} / Sell {mega_name}",
                                 "Buy_Ask": round(float(r["ask_mini"]), 2),
                                 "Sell_Bid": round(float(r["bid_mega"]), 2),
-                                "Arb_Spread": round(s1, 2)
+                                "Arb_Spread": round(s1, 2),
                             }
                             (cross_ce if opt == "CE" else cross_pe).append(item)
                     if r["bid_mini"] > 0 and r["ask_mega"] > 0:
@@ -642,18 +857,28 @@ class QuantOTMArbitrageEngine:
                                 "Strategy": f"Buy {mega_name} / Sell {mini_name}",
                                 "Buy_Ask": round(float(r["ask_mega"]), 2),
                                 "Sell_Bid": round(float(r["bid_mini"]), 2),
-                                "Arb_Spread": round(s2, 2)
+                                "Arb_Spread": round(s2, 2),
                             }
                             (cross_ce if opt == "CE" else cross_pe).append(item)
-                    if include_quoted and r["ask_mega"] > 0 and r["ask_mini"] > 0:
-                        qd = round(abs(float(r["ask_mega"] - r["ask_mini"])), 4)
+                    if (
+                        include_quoted
+                        and r["ask_mega"] > 0
+                        and r["ask_mini"] > 0
+                    ):
+                        qd = round(
+                            abs(float(r["ask_mega"] - r["ask_mini"])), 4
+                        )
                         if qd >= max(0.05, min_spread) and qd > 0:
                             if r["ask_mega"] > r["ask_mini"]:
                                 strat = f"Quote: {mini_name} Ask < {mega_name} Ask"
-                                b_px, s_px = float(r["ask_mini"]), float(r["ask_mega"])
+                                b_px, s_px = float(r["ask_mini"]), float(
+                                    r["ask_mega"]
+                                )
                             else:
                                 strat = f"Quote: {mega_name} Ask < {mini_name} Ask"
-                                b_px, s_px = float(r["ask_mega"]), float(r["ask_mini"])
+                                b_px, s_px = float(r["ask_mega"]), float(
+                                    r["ask_mini"]
+                                )
                             item = {
                                 "PinSpec": pin_id,
                                 "Strike": k,
@@ -661,11 +886,10 @@ class QuantOTMArbitrageEngine:
                                 "Strategy": strat,
                                 "Buy_Ask": round(b_px, 2),
                                 "Sell_Bid": round(s_px, 2),
-                                "Arb_Spread": round(qd, 2)
+                                "Arb_Spread": round(qd, 2),
                             }
                             (cross_ce if opt == "CE" else cross_pe).append(item)
 
-        # B. Vertical Monotonicity OTM Arbitrage (Same Contract)
         target_names = df_otm["name"].unique().tolist()
         if contract_scope == "Mega Only":
             target_names = [n for n in target_names if n == mega_name]
@@ -674,16 +898,20 @@ class QuantOTMArbitrageEngine:
 
         for name in target_names:
             for opt_type in ["CE", "PE"]:
-                sub = df_otm[(df_otm["name"] == name) & (df_otm["opt_type"] == opt_type)].copy()
+                sub = df_otm[
+                    (df_otm["name"] == name) & (df_otm["opt_type"] == opt_type)
+                ].copy()
                 if len(sub) < 2:
                     continue
                 asc = True if opt_type == "CE" else False
-                sub = sub.sort_values("strike", ascending=asc).reset_index(drop=True)
-                
+                sub = sub.sort_values("strike", ascending=asc).reset_index(
+                    drop=True
+                )
+
                 asks = sub["ask"].where(sub["ask"] > 0, np.nan).to_numpy()
                 strikes = sub["strike"].to_numpy()
                 bids = sub["bid"].to_numpy()
-                
+
                 min_ask_val, min_ask_idx = np.inf, -1
                 for i in range(len(sub)):
                     if min_ask_idx != -1:
@@ -700,9 +928,11 @@ class QuantOTMArbitrageEngine:
                                 "Buy_Ask": round(float(min_ask_val), 2),
                                 "Sell_Strike": s_k,
                                 "Sell_Bid": round(float(bids[i]), 2),
-                                "Arb_Spread": round(sp, 2)
+                                "Arb_Spread": round(sp, 2),
                             }
-                            (vert_ce if opt_type == "CE" else vert_pe).append(v_item)
+                            (vert_ce if opt_type == "CE" else vert_pe).append(
+                                v_item
+                            )
                         if include_quoted and not np.isnan(asks[i]):
                             qsp = round(float(asks[i] - min_ask_val), 4)
                             if qsp >= max(0.05, min_spread) and qsp > 0:
@@ -714,9 +944,11 @@ class QuantOTMArbitrageEngine:
                                     "Buy_Ask": round(float(min_ask_val), 2),
                                     "Sell_Strike": s_k,
                                     "Sell_Bid": round(float(asks[i]), 2),
-                                    "Arb_Spread": round(qsp, 2)
+                                    "Arb_Spread": round(qsp, 2),
                                 }
-                                (vert_ce if opt_type == "CE" else vert_pe).append(v_item)
+                                (
+                                    vert_ce if opt_type == "CE" else vert_pe
+                                ).append(v_item)
                     if not np.isnan(asks[i]) and asks[i] < min_ask_val:
                         min_ask_val, min_ask_idx = asks[i], i
 
@@ -725,7 +957,11 @@ class QuantOTMArbitrageEngine:
                 return pd.DataFrame()
             d = pd.DataFrame(rows)
             d["is_exec"] = (d["Type"] == "EXEC").astype(int)
-            d.sort_values(by=["is_exec", "Arb_Spread"], ascending=[False, False], inplace=True)
+            d.sort_values(
+                by=["is_exec", "Arb_Spread"],
+                ascending=[False, False],
+                inplace=True,
+            )
             d.drop(columns=["is_exec"], inplace=True)
             return d.reset_index(drop=True)
 
@@ -734,23 +970,76 @@ class QuantOTMArbitrageEngine:
         df_v_ce = sort_opt(vert_ce)
         df_v_pe = sort_opt(vert_pe)
 
-        # Build Unified Top Leaderboard
         lb = []
-        show_cross = has_mini and arb_mode in ["Both (Cross + Vertical)", "Cross-Contract Only (Mega vs Mini)"]
-        show_vert  = (not has_mini) or arb_mode in ["Both (Cross + Vertical)", "Vertical Only (Same Contract)"]
+        show_cross = has_mini and arb_mode in [
+            "Both (Cross + Vertical)",
+            "Cross-Contract Only (Mega vs Mini)",
+        ]
+        show_vert = (not has_mini) or arb_mode in [
+            "Both (Cross + Vertical)",
+            "Vertical Only (Same Contract)",
+        ]
 
         if show_cross and not df_c_ce.empty:
             for _, r in df_c_ce.head(5).iterrows():
-                lb.append({"PinSpec": r["PinSpec"], "Option": "CALL (CE)", "Mode": "Cross", "Type": r["Type"], "Pair": f"{r['Strike']:g}", "Strategy": r["Strategy"], "Buy_Ask": r["Buy_Ask"], "Sell_Bid": r["Sell_Bid"], "Arb_Spread": r["Arb_Spread"]})
+                lb.append(
+                    {
+                        "PinSpec": r["PinSpec"],
+                        "Option": "CALL (CE)",
+                        "Mode": "Cross",
+                        "Type": r["Type"],
+                        "Pair": f"{r['Strike']:g}",
+                        "Strategy": r["Strategy"],
+                        "Buy_Ask": r["Buy_Ask"],
+                        "Sell_Bid": r["Sell_Bid"],
+                        "Arb_Spread": r["Arb_Spread"],
+                    }
+                )
         if show_vert and not df_v_ce.empty:
             for _, r in df_v_ce.head(5).iterrows():
-                lb.append({"PinSpec": r["PinSpec"], "Option": "CALL (CE)", "Mode": "Vertical", "Type": r["Type"], "Pair": f"{r['Buy_Strike']:g}/{r['Sell_Strike']:g}", "Strategy": f"{r['Contract']} Vertical", "Buy_Ask": r["Buy_Ask"], "Sell_Bid": r["Sell_Bid"], "Arb_Spread": r["Arb_Spread"]})
+                lb.append(
+                    {
+                        "PinSpec": r["PinSpec"],
+                        "Option": "CALL (CE)",
+                        "Mode": "Vertical",
+                        "Type": r["Type"],
+                        "Pair": f"{r['Buy_Strike']:g}/{r['Sell_Strike']:g}",
+                        "Strategy": f"{r['Contract']} Vertical",
+                        "Buy_Ask": r["Buy_Ask"],
+                        "Sell_Bid": r["Sell_Bid"],
+                        "Arb_Spread": r["Arb_Spread"],
+                    }
+                )
         if show_cross and not df_c_pe.empty:
             for _, r in df_c_pe.head(5).iterrows():
-                lb.append({"PinSpec": r["PinSpec"], "Option": "PUT (PE)", "Mode": "Cross", "Type": r["Type"], "Pair": f"{r['Strike']:g}", "Strategy": r["Strategy"], "Buy_Ask": r["Buy_Ask"], "Sell_Bid": r["Sell_Bid"], "Arb_Spread": r["Arb_Spread"]})
+                lb.append(
+                    {
+                        "PinSpec": r["PinSpec"],
+                        "Option": "PUT (PE)",
+                        "Mode": "Cross",
+                        "Type": r["Type"],
+                        "Pair": f"{r['Strike']:g}",
+                        "Strategy": r["Strategy"],
+                        "Buy_Ask": r["Buy_Ask"],
+                        "Sell_Bid": r["Sell_Bid"],
+                        "Arb_Spread": r["Arb_Spread"],
+                    }
+                )
         if show_vert and not df_v_pe.empty:
             for _, r in df_v_pe.head(5).iterrows():
-                lb.append({"PinSpec": r["PinSpec"], "Option": "PUT (PE)", "Mode": "Vertical", "Type": r["Type"], "Pair": f"{r['Buy_Strike']:g}/{r['Sell_Strike']:g}", "Strategy": f"{r['Contract']} Vertical", "Buy_Ask": r["Buy_Ask"], "Sell_Bid": r["Sell_Bid"], "Arb_Spread": r["Arb_Spread"]})
+                lb.append(
+                    {
+                        "PinSpec": r["PinSpec"],
+                        "Option": "PUT (PE)",
+                        "Mode": "Vertical",
+                        "Type": r["Type"],
+                        "Pair": f"{r['Buy_Strike']:g}/{r['Sell_Strike']:g}",
+                        "Strategy": f"{r['Contract']} Vertical",
+                        "Buy_Ask": r["Buy_Ask"],
+                        "Sell_Bid": r["Sell_Bid"],
+                        "Arb_Spread": r["Arb_Spread"],
+                    }
+                )
 
         df_lb = sort_opt(lb).head(8) if lb else pd.DataFrame()
 
@@ -760,66 +1049,91 @@ class QuantOTMArbitrageEngine:
             "df_c_ce": df_c_ce,
             "df_c_pe": df_c_pe,
             "df_v_ce": df_v_ce,
-            "df_v_pe": df_v_pe
+            "df_v_pe": df_v_pe,
         }
-        return results, current_spot, meta_copy, (active_quotes, total_contracts, ws_ticks, rest_syncs)
+        return (
+            results,
+            current_spot,
+            meta_copy,
+            (active_quotes, total_contracts, ws_ticks, rest_syncs),
+        )
+
 
 # ==============================================================================
-# 4. TERMINAL RENDERER (CROSS & VERTICAL TOP-5 DEPTH + CLEAN OTM TABLES)
+# 4. TERMINAL RENDERER
 # ==============================================================================
 IST_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+
 
 def render_table_html(df: pd.DataFrame, accent_color: str) -> str:
     if df is None or df.empty:
         return "<div style='color:#64748b; font-style:italic; padding:9px 12px; background:#080d19; border:1px dashed #1e293b; border-radius:8px; margin-top:5px; font-size:12px;'>No active OTM opportunities above threshold on this tick.</div>"
-    
+
     df_disp = df.copy()
-    has_pin = "PinSpec" in df_disp.columns
     display_cols = [c for c in df_disp.columns if c != "PinSpec"]
-    
-    headers = "".join([
-        f"<th style='padding:7px 11px; text-align:left; border-bottom:1px solid #1e293b; color:#94a3b8; font-size:10.5px; letter-spacing:0.6px; text-transform:uppercase;'>{c}</th>"
-        for c in display_cols
-    ])
-    if has_pin:
-        headers += "<th style='padding:7px 11px; text-align:center; border-bottom:1px solid #1e293b; color:#94a3b8; font-size:10.5px;'>PIN</th>"
+
+    headers = "".join(
+        [
+            f"<th style='padding:7px 11px; text-align:left; border-bottom:1px solid #1e293b; color:#94a3b8; font-size:10.5px; letter-spacing:0.6px; text-transform:uppercase;'>{c}</th>"
+            for c in display_cols
+        ]
+    )
 
     rows_html = []
     for idx, row in df_disp.iterrows():
-        is_exec = (row.get("Type") == "EXEC")
-        bg = "rgba(13,21,38,0.92)" if idx % 2 == 0 else "rgba(21,32,54,0.72)"
+        is_exec = row.get("Type") == "EXEC"
+        bg = (
+            "rgba(13,21,38,0.92)"
+            if idx % 2 == 0
+            else "rgba(21,32,54,0.72)"
+        )
         if idx == 0 and is_exec:
-            bg = "rgba(6,78,59,0.52)" if accent_color in ["#10b981", "#f59e0b"] else "rgba(136,19,55,0.45)"
+            bg = (
+                "rgba(6,78,59,0.52)"
+                if accent_color in ["#10b981", "#f59e0b"]
+                else "rgba(136,19,55,0.45)"
+            )
         cells = []
         for c in display_cols:
             val = row[c]
             if c == "Arb_Spread":
                 b_bg = accent_color if is_exec else "#334155"
-                b_fg = "#090e1a" if (is_exec and accent_color == "#f59e0b") else "#ffffff"
-                cells.append(f"<td style='padding:6px 11px; font-variant-numeric:tabular-nums;'><span style='background:{b_bg}; color:{b_fg}; padding:2px 9px; border-radius:5px; font-weight:800; font-size:12.5px;'>+₹{float(val):.2f}</span></td>")
+                b_fg = (
+                    "#090e1a"
+                    if (is_exec and accent_color == "#f59e0b")
+                    else "#ffffff"
+                )
+                cells.append(
+                    f"<td style='padding:6px 11px; font-variant-numeric:tabular-nums;'><span style='background:{b_bg}; color:{b_fg}; padding:2px 9px; border-radius:5px; font-weight:800; font-size:12.5px;'>+₹{float(val):.2f}</span></td>"
+                )
             elif c == "Type":
                 t_bg = "#059669" if is_exec else "#1e293b"
                 t_fg = "#ffffff" if is_exec else "#94a3b8"
-                cells.append(f"<td style='padding:6px 11px;'><span style='background:{t_bg}; color:{t_fg}; padding:2px 7px; border-radius:4px; font-size:10.5px; font-weight:800;'>{val}</span></td>")
+                cells.append(
+                    f"<td style='padding:6px 11px;'><span style='background:{t_bg}; color:{t_fg}; padding:2px 7px; border-radius:4px; font-size:10.5px; font-weight:800;'>{val}</span></td>"
+                )
             elif c == "Option":
                 oc = "#34d399" if "CALL" in str(val) else "#fb7185"
-                cells.append(f"<td style='padding:6px 11px; font-weight:800; color:{oc}; font-size:12px;'>{val}</td>")
+                cells.append(
+                    f"<td style='padding:6px 11px; font-weight:800; color:{oc}; font-size:12px;'>{val}</td>"
+                )
             elif c in ["Buy_Ask", "Sell_Bid"]:
-                cells.append(f"<td style='padding:6px 11px; color:#cbd5e1; font-size:12.5px; font-variant-numeric:tabular-nums;'>₹{float(val):.2f}</td>")
+                cells.append(
+                    f"<td style='padding:6px 11px; color:#cbd5e1; font-size:12.5px; font-variant-numeric:tabular-nums;'>₹{float(val):.2f}</td>"
+                )
             elif "Strike" in c or c == "Pair":
                 disp_s = f"{val:g}" if isinstance(val, (int, float)) else val
-                cells.append(f"<td style='padding:6px 11px; font-weight:700; color:#f8fafc; font-size:12.5px; font-variant-numeric:tabular-nums;'>{disp_s}</td>")
+                cells.append(
+                    f"<td style='padding:6px 11px; font-weight:700; color:#f8fafc; font-size:12.5px; font-variant-numeric:tabular-nums;'>{disp_s}</td>"
+                )
             else:
-                cells.append(f"<td style='padding:6px 11px; color:#e2e8f0; font-size:12px;'>{val}</td>")
-                
-        if has_pin:
-            spec_str = str(row["PinSpec"])
-            cells.append(
-                f"<td style='padding:6px 11px; text-align:center;'>"
-                f"<button onclick=\"google.colab.kernel.invokeFunction('notebook.pin_item_cb', ['{spec_str}'], {{}})\" "
-                f"style='background:rgba(56,189,248,0.14); color:#38bdf8; border:1px solid rgba(56,189,248,0.4); padding:2px 8px; border-radius:5px; font-size:11px; font-weight:700; cursor:pointer;'>📌 Pin</button></td>"
-            )
-        rows_html.append(f"<tr style='background:{bg}; border-bottom:1px solid rgba(30,41,59,0.7);'>{''.join(cells)}</tr>")
+                cells.append(
+                    f"<td style='padding:6px 11px; color:#e2e8f0; font-size:12px;'>{val}</td>"
+                )
+
+        rows_html.append(
+            f"<tr style='background:{bg}; border-bottom:1px solid rgba(30,41,59,0.7);'>{''.join(cells)}</tr>"
+        )
 
     return f"""
     <table style='width:100%; border-collapse:collapse; margin-top:5px; margin-bottom:10px; border-radius:8px; overflow:hidden; border:1px solid #1e293b;'>
@@ -828,23 +1142,40 @@ def render_table_html(df: pd.DataFrame, accent_color: str) -> str:
     </table>
     """
 
-def _render_top5_depth_ladder(title: str, buy_levels: list, sell_levels: list) -> str:
+
+def _render_top5_depth_ladder(
+    title: str, buy_levels: list, sell_levels: list
+) -> str:
     rows = []
     for idx in range(5):
-        b = buy_levels[idx] if idx < len(buy_levels) else {"price": 0.0, "qty": 0}
-        s = sell_levels[idx] if idx < len(sell_levels) else {"price": 0.0, "qty": 0}
+        b = (
+            buy_levels[idx]
+            if idx < len(buy_levels)
+            else {"price": 0.0, "qty": 0}
+        )
+        s = (
+            sell_levels[idx]
+            if idx < len(sell_levels)
+            else {"price": 0.0, "qty": 0}
+        )
         b_qty_txt = f"{b['qty']:,}" if b["qty"] > 0 else "—"
-        b_px_txt  = f"₹{b['price']:.2f}" if b["price"] > 0 else "—"
-        s_px_txt  = f"₹{s['price']:.2f}" if s["price"] > 0 else "—"
+        b_px_txt = f"₹{b['price']:.2f}" if b["price"] > 0 else "—"
+        s_px_txt = f"₹{s['price']:.2f}" if s["price"] > 0 else "—"
         s_qty_txt = f"{s['qty']:,}" if s["qty"] > 0 else "—"
-        bg = "rgba(15,23,42,0.9)" if idx % 2 == 0 else "rgba(23,33,54,0.75)"
-        rows.append(f"""
+        bg = (
+            "rgba(15,23,42,0.9)"
+            if idx % 2 == 0
+            else "rgba(23,33,54,0.75)"
+        )
+        rows.append(
+            f"""
         <tr style='background:{bg}; border-bottom:1px solid #1e293b; font-variant-numeric:tabular-nums;'>
             <td style='padding:4px 7px; color:#94a3b8; font-size:11px; text-align:right;'>{b_qty_txt}</td>
             <td style='padding:4px 7px; color:#34d399; font-weight:700; font-size:12px; text-align:right; border-right:1px solid #334155;'>{b_px_txt}</td>
             <td style='padding:4px 7px; color:#fb7185; font-weight:700; font-size:12px; text-align:left;'>{s_px_txt}</td>
             <td style='padding:4px 7px; color:#94a3b8; font-size:11px; text-align:left;'>{s_qty_txt}</td>
-        </tr>""")
+        </tr>"""
+        )
 
     return f"""
     <div style='background:#0d1526; border:1px solid #1e293b; border-radius:8px; padding:8px;'>
@@ -862,55 +1193,72 @@ def _render_top5_depth_ladder(title: str, buy_levels: list, sell_levels: list) -
         </table>
     </div>"""
 
+
 def render_pinned_cards_html(pinned_cards: list) -> str:
     if not pinned_cards:
-        return "<div style='color:#94a3b8; font-style:italic; padding:9px 12px; background:#080d19; border:1px dashed #33486e; border-radius:8px; font-size:12px;'>No strikes pinned yet. Type a single strike (e.g., <b>9000</b>) or a vertical pair (e.g., <b>9000-9200</b>) above, or click <b>📌 Pin</b> on any Cross or Vertical row below to inspect live Best Bid/Ask + side-by-side Top-5 Order Book Depth.</div>"
-    
+        return "<div style='color:#94a3b8; font-style:italic; padding:9px 12px; background:#080d19; border:1px dashed #33486e; border-radius:8px; font-size:12px;'>No strikes pinned yet. Type a single strike (e.g., <b>9000</b>) or a vertical pair (e.g., <b>9000-9200</b>) in the Track Strike box above to inspect live Best Bid/Ask + side-by-side Top-5 Order Book Depth.</div>"
+
     cards = []
     for card in pinned_cards:
-        spec = card.get("spec", "")
         kind = card.get("kind", "CROSS")
         status = card.get("status", "NOT_FOUND")
 
         if status != "OTM_OK":
-            title_lbl = f"Strike {card.get('strike', 0):g}" if kind == "CROSS" else f"{card.get('contract', '')} {card.get('buy_strike', 0):g} / {card.get('sell_strike', 0):g}"
-            msg = "Not found in active near-month chain." if status == "NOT_FOUND" else f"Hidden because one or both legs are ITM/ATM relative to Spot (₹{card.get('spot', 0):.2f}). Only strictly OTM strikes are displayed."
-            cards.append(f"""
+            title_lbl = (
+                f"Strike {card.get('strike', 0):g}"
+                if kind == "CROSS"
+                else f"{card.get('contract', '')} {card.get('buy_strike', 0):g} / {card.get('sell_strike', 0):g}"
+            )
+            msg = (
+                "Not found in active near-month chain."
+                if status == "NOT_FOUND"
+                else f"Hidden because one or both legs are ITM/ATM relative to Spot (₹{card.get('spot', 0):.2f}). Only strictly OTM strikes are displayed."
+            )
+            cards.append(
+                f"""
             <div style='background:#080d19; border:1px solid #33486e; border-radius:10px; padding:11px; margin-bottom:10px;'>
                 <div style='display:flex; justify-content:space-between; align-items:center;'>
                     <span style='font-size:15px; font-weight:800; color:#fbbf24;'>{title_lbl}</span>
-                    <button onclick="google.colab.kernel.invokeFunction('notebook.unpin_item_cb', ['{spec}'], {{}})" style='background:#1e293b; color:#e2e8f0; border:1px solid #334155; padding:2px 8px; border-radius:5px; font-size:11px; cursor:pointer;'>✕ Remove</button>
                 </div>
                 <div style='color:#94a3b8; font-size:12px; margin-top:6px;'>{msg}</div>
-            </div>""")
+            </div>"""
+            )
             continue
 
         otm_type = card.get("otm_type", "CE")
         opt_badge = (
             "<span style='background:#065f46; color:#a7f3d0; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:800;'>🟢 OTM CALL (CE)</span>"
-            if otm_type == "CE" else
-            "<span style='background:#881337; color:#fecdd3; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:800;'>🔴 OTM PUT (PE)</span>"
+            if otm_type == "CE"
+            else "<span style='background:#881337; color:#fecdd3; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:800;'>🔴 OTM PUT (PE)</span>"
         )
 
         pk_val = card.get("peak_val")
         pk_str = f"₹{pk_val:.2f}" if pk_val is not None else "—"
         b_exec = card.get("best_exec")
-        is_pos = (b_exec is not None and b_exec > 0)
-        sp_txt = f"{'+' if b_exec>=0 else ''}₹{b_exec:.2f}" if b_exec is not None else "N/A"
+        is_pos = b_exec is not None and b_exec > 0
+        sp_txt = (
+            f"{'+' if b_exec>=0 else ''}₹{b_exec:.2f}"
+            if b_exec is not None
+            else "N/A"
+        )
         b_bg = "rgba(16,185,129,0.18)" if is_pos else "rgba(100,116,139,0.15)"
         b_bd = "#059669" if is_pos else "#334155"
         b_fg = "#34d399" if is_pos else "#cbd5e1"
 
-        # ----------------------------------------------------------------------
-        # CASE 1: CROSS-CONTRACT CARD (MEGA vs MINI TOP-5 DEPTH)
-        # ----------------------------------------------------------------------
         if kind == "CROSS":
             k = card.get("strike", 0)
-            ask_d = f"₹{card['ask_diff']:.2f}" if card.get("ask_diff") is not None else "—"
-            bid_d = f"₹{card['bid_diff']:.2f}" if card.get("bid_diff") is not None else "—"
+            ask_d = (
+                f"₹{card['ask_diff']:.2f}"
+                if card.get("ask_diff") is not None
+                else "—"
+            )
+            bid_d = (
+                f"₹{card['bid_diff']:.2f}"
+                if card.get("bid_diff") is not None
+                else "—"
+            )
             mini_row = ""
             cross_box = ""
-            depth_html = ""
 
             if card.get("has_mini"):
                 mini_row = f"""
@@ -939,9 +1287,14 @@ def render_pinned_cards_html(pinned_cards: list) -> str:
                     {_render_top5_depth_ladder(f"{card.get('mini_name', '')} {otm_type}", card.get('s_depth_buy', []), card.get('s_depth_sell', []))}
                 </div>"""
             else:
-                depth_html = _render_top5_depth_ladder(f"{card.get('mega_name', '')} {otm_type}", card.get('m_depth_buy', []), card.get('m_depth_sell', []))
+                depth_html = _render_top5_depth_ladder(
+                    f"{card.get('mega_name', '')} {otm_type}",
+                    card.get("m_depth_buy", []),
+                    card.get("m_depth_sell", []),
+                )
 
-            cards.append(f"""
+            cards.append(
+                f"""
             <div style='background:#080d19; border:1px solid #2d3f63; border-radius:10px; padding:11px; margin-bottom:10px;'>
                 <div style='display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; padding-bottom:7px; margin-bottom:9px;'>
                     <div style='display:flex; align-items:center; gap:9px;'>
@@ -950,7 +1303,6 @@ def render_pinned_cards_html(pinned_cards: list) -> str:
                         {opt_badge}
                         <span style='font-size:11.5px; color:#94a3b8;'>{card.get('mega_name', '')}{' vs ' + card.get('mini_name', '') if card.get('has_mini') else ''}</span>
                     </div>
-                    <button onclick="google.colab.kernel.invokeFunction('notebook.unpin_item_cb', ['{spec}'], {{}})" style='background:#1e293b; color:#e2e8f0; border:1px solid #334155; padding:2px 9px; border-radius:5px; font-size:11px; cursor:pointer;'>✕ Unpin</button>
                 </div>
                 <div style='display:grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap:12px; align-items:start;'>
                     <div>
@@ -967,19 +1319,25 @@ def render_pinned_cards_html(pinned_cards: list) -> str:
                         {depth_html}
                     </div>
                 </div>
-            </div>""")
+            </div>"""
+            )
 
-        # ----------------------------------------------------------------------
-        # CASE 2: VERTICAL PAIR CARD (BOTH STRIKES' TOP-5 DEPTH SIDE BY SIDE)
-        # ----------------------------------------------------------------------
         elif kind == "VERT":
             cname = card.get("contract", "")
             bk = card.get("buy_strike", 0)
             sk = card.get("sell_strike", 0)
             a_inv = card.get("ask_inv")
             b_dif = card.get("bid_diff")
-            ask_inv_txt = f"{'+' if a_inv>=0 else ''}₹{a_inv:.2f}" if a_inv is not None else "—"
-            bid_d_txt   = f"{'+' if b_dif>=0 else ''}₹{b_dif:.2f}" if b_dif is not None else "—"
+            ask_inv_txt = (
+                f"{'+' if a_inv>=0 else ''}₹{a_inv:.2f}"
+                if a_inv is not None
+                else "—"
+            )
+            bid_d_txt = (
+                f"{'+' if b_dif>=0 else ''}₹{b_dif:.2f}"
+                if b_dif is not None
+                else "—"
+            )
 
             vert_box = f"""
             <div style='padding:8px 10px; border-radius:7px; background:{b_bg}; border:1px solid {b_bd}; color:{b_fg}; font-size:12px; font-variant-numeric:tabular-nums;'>
@@ -999,7 +1357,8 @@ def render_pinned_cards_html(pinned_cards: list) -> str:
                 {_render_top5_depth_ladder(f"{cname} {sk:g} {otm_type} (SELL)", card.get('s_depth_buy', []), card.get('s_depth_sell', []))}
             </div>"""
 
-            cards.append(f"""
+            cards.append(
+                f"""
             <div style='background:#080d19; border:1px solid #047857; border-radius:10px; padding:11px; margin-bottom:10px;'>
                 <div style='display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #1e293b; padding-bottom:7px; margin-bottom:9px;'>
                     <div style='display:flex; align-items:center; gap:9px;'>
@@ -1007,7 +1366,6 @@ def render_pinned_cards_html(pinned_cards: list) -> str:
                         <span style='font-size:16px; font-weight:800; color:#38bdf8; font-variant-numeric:tabular-nums;'>{cname} {bk:g} / {sk:g}</span>
                         {opt_badge}
                     </div>
-                    <button onclick="google.colab.kernel.invokeFunction('notebook.unpin_item_cb', ['{spec}'], {{}})" style='background:#1e293b; color:#e2e8f0; border:1px solid #334155; padding:2px 9px; border-radius:5px; font-size:11px; cursor:pointer;'>✕ Unpin</button>
                 </div>
                 <div style='display:grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap:12px; align-items:start;'>
                     <div>
@@ -1027,27 +1385,44 @@ def render_pinned_cards_html(pinned_cards: list) -> str:
                         {depth_html}
                     </div>
                 </div>
-            </div>""")
+            </div>"""
+            )
 
     return "".join(cards)
 
-def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, contract_scope, pinned_specs, scan_count, is_running):
+
+def build_full_terminal_html(
+    engine,
+    min_spread,
+    include_quoted,
+    active_mode,
+    contract_scope,
+    pinned_specs,
+    scan_count,
+    is_running,
+):
     results, live_spot, meta, health = engine.run_otm_scan(
         min_spread=min_spread,
         include_quoted=include_quoted,
         arb_mode=active_mode,
         contract_scope=contract_scope,
-        pinned_specs=pinned_specs
+        pinned_specs=pinned_specs,
     )
-    active_q, total_q, ws_ticks, rest_syncs = health
-    ist_now = datetime.now(IST_TIMEZONE).strftime('%H:%M:%S.%f')[:-3]
-    ist_date = datetime.now(IST_TIMEZONE).strftime('%d %b %Y')
+    active_q, total_q, _, _ = health
+    ist_now = datetime.now(IST_TIMEZONE).strftime("%H:%M:%S.%f")[:-3]
+    ist_date = datetime.now(IST_TIMEZONE).strftime("%d %b %Y")
 
     has_mini = bool(meta.get("has_mini"))
-    show_cross = has_mini and active_mode in ["Both (Cross + Vertical)", "Cross-Contract Only (Mega vs Mini)"]
-    show_vert  = (not has_mini) or active_mode in ["Both (Cross + Vertical)", "Vertical Only (Same Contract)"]
+    show_cross = has_mini and active_mode in [
+        "Both (Cross + Vertical)",
+        "Cross-Contract Only (Mega vs Mini)",
+    ]
+    show_vert = (not has_mini) or active_mode in [
+        "Both (Cross + Vertical)",
+        "Vertical Only (Same Contract)",
+    ]
 
-    df_lb   = results.get("df_lb", pd.DataFrame())
+    df_lb = results.get("df_lb", pd.DataFrame())
     df_c_ce = results.get("df_c_ce", pd.DataFrame())
     df_c_pe = results.get("df_c_pe", pd.DataFrame())
     df_v_ce = results.get("df_v_ce", pd.DataFrame())
@@ -1067,14 +1442,13 @@ def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, co
 
     status_pill = (
         "<span style='background:rgba(16,185,129,0.2); color:#34d399; border:1px solid #059669; padding:2px 9px; border-radius:99px; font-size:10.5px; font-weight:800;'>● AUTO-REFRESH 1s</span>"
-        if is_running else
-        "<span style='background:rgba(239,68,68,0.2); color:#f87171; border:1px solid #dc2626; padding:2px 9px; border-radius:99px; font-size:10.5px; font-weight:800;'>■ STOPPED</span>"
+        if is_running
+        else "<span style='background:rgba(239,68,68,0.2); color:#f87171; border:1px solid #dc2626; padding:2px 9px; border-radius:99px; font-size:10.5px; font-weight:800;'>■ STOPPED</span>"
     )
 
     return f"""
     <div style='font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#060a12; color:#f8fafc; padding:14px; border-radius:14px; border:1px solid #1e2d4a; box-shadow: 0 12px 32px rgba(0,0,0,0.5);'>
         
-        <!-- 3-CARD CLEAN TELEMETRY STRIP -->
         <div style='display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap:10px; margin-bottom:12px;'>
             <div style='background:#0d1526; border:1px solid #1e2d4a; border-radius:10px; padding:10px 14px;'>
                 <div style='display:flex; justify-content:space-between; align-items:center;'>
@@ -1101,7 +1475,6 @@ def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, co
             </div>
         </div>
 
-        <!-- 1. CUSTOM STRIKE WATCHLIST (OTM ONLY + LIVE TOP-5 DEPTH FOR CROSS & VERTICAL) -->
         <div style='background:#0d1526; border:1px solid #4338ca; border-radius:12px; padding:12px; margin-bottom:12px;'>
             <div style='background:linear-gradient(90deg, #312e81, #4338ca); color:#e0e7ff; padding:6px 12px; border-radius:6px; font-weight:800; font-size:12.5px; display:flex; justify-content:space-between; margin-bottom:9px;'>
                 <span>🎯 PINNED STRIKE INSPECTOR (OTM ONLY + LIVE TOP-5 ORDER DEPTH)</span>
@@ -1110,7 +1483,6 @@ def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, co
             {render_pinned_cards_html(results.get('pinned_cards', []))}
         </div>
 
-        <!-- 2. TOP ARBITRAGE LEADERBOARD -->
         <div style='background:#0d1526; border:1px solid #92400e; border-radius:12px; padding:12px; margin-bottom:12px;'>
             <div style='background:linear-gradient(90deg, #78350f, #b45309); color:#fef3c7; padding:6px 12px; border-radius:6px; font-weight:800; font-size:12.5px; display:flex; justify-content:space-between;'>
                 <span>🏆 TOP ARBITRAGE SPREADS (HIGHEST TO LOWEST ACROSS ALL OTM OPTIONS)</span>
@@ -1119,7 +1491,6 @@ def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, co
             {render_table_html(df_lb, '#f59e0b')}
         </div>
 
-        <!-- 3. TOP OTM CALL SPREADS (CE > SPOT) -->
         <div style='background:#0d1526; border:1px solid #065f46; border-radius:12px; padding:12px; margin-bottom:12px;'>
             <div style='background:linear-gradient(90deg, #064e3b, #047857); color:#ecfdf5; padding:6px 12px; border-radius:6px; font-weight:800; font-size:12.5px; display:flex; justify-content:space-between;'>
                 <span>🟢 TOP OTM CALL SPREADS (CE — STRIKES &gt; ₹{live_spot:.2f})</span>
@@ -1128,7 +1499,6 @@ def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, co
             {ce_sections}
         </div>
 
-        <!-- 4. TOP OTM PUT SPREADS (PE < SPOT) -->
         <div style='background:#0d1526; border:1px solid #881337; border-radius:12px; padding:12px;'>
             <div style='background:linear-gradient(90deg, #4c0519, #9f1239); color:#fff1f2; padding:6px 12px; border-radius:6px; font-weight:800; font-size:12.5px; display:flex; justify-content:space-between;'>
                 <span>🔴 TOP OTM PUT SPREADS (PE — STRIKES &lt; ₹{live_spot:.2f})</span>
@@ -1140,290 +1510,198 @@ def build_full_terminal_html(engine, min_spread, include_quoted, active_mode, co
     </div>
     """
 
+
 # ==============================================================================
-# 5. INTERACTIVE CONTROL BAR & BROWSER-DRIVEN 1-SECOND LIVE LOOP
+# 5. STREAMLIT STATE & UI CONTROLS
 # ==============================================================================
-smart_api, jwt_token, feed_token = authenticate_angel_one()
-df_master_cache = download_scrip_master()
+if "engine" not in st.session_state:
+    with st.spinner("Connecting to Angel One API & WebSocket..."):
+        smart_api, jwt_token, feed_token = authenticate_angel_one()
+        df_master_cache = download_scrip_master()
+        engine = QuantOTMArbitrageEngine(smart_api, jwt_token, feed_token)
+        engine.start_websocket()
+        engine.start_rest_worker()
 
-engine = QuantOTMArbitrageEngine(smart_api, jwt_token, feed_token)
-engine.start_websocket()
+        default_comm = "MCX Crude Oil (Crude + Crude Mini)"
+        df_c, meta = extract_contracts_for_selection(
+            df_master_cache, smart_api, COMMODITY_CONFIGS[default_comm]
+        )
+        engine.switch_contracts(df_c, meta)
 
-commodity_dropdown = widgets.Dropdown(
-    options=list(COMMODITY_CONFIGS.keys()),
-    value="MCX Crude Oil (Crude + Crude Mini)",
-    description="Commodity:",
-    style={'description_width': '75px'},
-    layout=widgets.Layout(width='310px')
-)
+        st.session_state.smart_api = smart_api
+        st.session_state.df_master_cache = df_master_cache
+        st.session_state.engine = engine
+        st.session_state.active_commodity = default_comm
+        st.session_state.running = True
+        st.session_state.scan_count = 0
+        st.session_state.pinned_by_commodity = {}
 
-mode_dropdown = widgets.Dropdown(
-    options=[
-        "Both (Cross + Vertical)",
-        "Vertical Only (Same Contract)",
-        "Cross-Contract Only (Mega vs Mini)"
-    ],
-    value="Both (Cross + Vertical)",
-    description="Arb Mode:",
-    style={'description_width': '68px'},
-    layout=widgets.Layout(width='295px')
-)
+engine = st.session_state.engine
 
-contract_scope_dropdown = widgets.Dropdown(
-    options=["All (Mega + Mini)", "Mega Only", "Mini Only"],
-    value="All (Mega + Mini)",
-    description="Contract:",
-    style={'description_width': '65px'},
-    layout=widgets.Layout(width='210px')
-)
+# Top Control Row 1
+c1, c2, c3, c4, c5 = st.columns([2.4, 2.2, 1.6, 1.3, 0.9])
 
-min_spread_input = widgets.BoundedFloatText(
-    value=0.00,
-    min=0.00,
-    max=1000.0,
-    step=0.05,
-    description="Min Spread (₹):",
-    style={'description_width': '100px'},
-    layout=widgets.Layout(width='170px')
-)
-
-include_quoted_chk = widgets.Checkbox(
-    value=True,
-    description="Quoted",
-    indent=False,
-    layout=widgets.Layout(width='85px')
-)
-
-custom_strike_input = widgets.Combobox(
-    placeholder="9000 or 9000-9200",
-    description="Track Strike:",
-    ensure_option=False,
-    style={'description_width': '85px'},
-    layout=widgets.Layout(width='245px')
-)
-
-track_strike_btn = widgets.Button(
-    description="+ Track Strike",
-    button_style="info",
-    layout=widgets.Layout(width='120px')
-)
-
-clear_strikes_btn = widgets.Button(
-    description="Clear Pinned",
-    button_style="",
-    layout=widgets.Layout(width='105px')
-)
-
-start_button = widgets.Button(
-    description="Start / Run",
-    button_style="success",
-    icon="play",
-    layout=widgets.Layout(width='115px')
-)
-
-stop_button = widgets.Button(
-    description="Stop",
-    button_style="danger",
-    icon="stop",
-    layout=widgets.Layout(width='90px')
-)
-
-status_label = widgets.HTML(value="<span style='background:#065f46; color:#a7f3d0; padding:5px 10px; border-radius:6px; font-weight:bold;'>● AUTO-REFRESHING (1s)</span>")
-dashboard_widget = widgets.HTML()
-
-SCANNER_CONTROL = {
-    "running": True,
-    "alive": True,
-    "scan_count": 0,
-    "pinned_by_commodity": {}
-}
-
-def get_current_pinned() -> list:
-    key = commodity_dropdown.value
-    return SCANNER_CONTROL["pinned_by_commodity"].setdefault(key, [])
-
-def _load_strikes_and_refresh(strikes_to_load: list):
-    for s in strikes_to_load:
-        engine.ensure_strike_loaded(s)
-    refresh_now()
-
-def pin_item_programmatic(spec_or_raw: str):
-    raw = str(spec_or_raw).strip()
-    if not raw:
-        return
-
-    spec = None
-    strikes_to_load = []
-
-    if raw.startswith("CROSS|") or raw.startswith("VERT|"):
-        spec = raw
-        parts = raw.split("|")
-        if parts[0] == "CROSS":
-            strikes_to_load = [float(parts[1])]
-        elif parts[0] == "VERT":
-            strikes_to_load = [float(parts[2]), float(parts[3])]
-    else:
-        cleaned = raw.replace("/", "-").replace(",", "-")
-        if "-" in cleaned:
-            nums = [float(x.strip()) for x in cleaned.split("-") if x.strip()]
-            if len(nums) == 2 and nums[0] > 0 and nums[1] > 0 and abs(nums[0] - nums[1]) > 1e-4:
-                spot = engine.fut_ltp
-                cname = engine.meta.get("mini") if (contract_scope_dropdown.value == "Mini Only" and engine.meta.get("mini")) else engine.meta.get("mega", "")
-                if spot > 0 and nums[0] < spot and nums[1] < spot:
-                    opt_type = "PE"
-                    buy_k, sell_k = max(nums[0], nums[1]), min(nums[0], nums[1])
-                else:
-                    opt_type = "CE"
-                    buy_k, sell_k = min(nums[0], nums[1]), max(nums[0], nums[1])
-                spec = f"VERT|{cname}|{buy_k:g}|{sell_k:g}|{opt_type}"
-                strikes_to_load = [buy_k, sell_k]
-        else:
-            try:
-                val = float(cleaned)
-                if val > 0:
-                    spec = f"CROSS|{val:g}"
-                    strikes_to_load = [val]
-            except Exception:
-                return
-
-    if not spec:
-        return
-
-    pinned = get_current_pinned()
-    if spec not in pinned:
-        pinned.insert(0, spec)
-        if len(pinned) > 10:
-            pinned.pop()
-
-    threading.Thread(target=_load_strikes_and_refresh, args=(strikes_to_load,), daemon=True).start()
-
-def unpin_item_programmatic(spec_str: str):
-    key = commodity_dropdown.value
-    pinned = SCANNER_CONTROL["pinned_by_commodity"].get(key, [])
-    SCANNER_CONTROL["pinned_by_commodity"][key] = [x for x in pinned if x != str(spec_str)]
-    refresh_now()
-
-def refresh_now():
-    SCANNER_CONTROL["scan_count"] += 1
-    dashboard_widget.value = build_full_terminal_html(
-        engine,
-        min_spread_input.value,
-        include_quoted_chk.value,
-        mode_dropdown.value,
-        contract_scope_dropdown.value,
-        get_current_pinned(),
-        SCANNER_CONTROL["scan_count"],
-        SCANNER_CONTROL["running"]
+with c1:
+    selected_comm = st.selectbox(
+        "Commodity",
+        options=list(COMMODITY_CONFIGS.keys()),
+        index=list(COMMODITY_CONFIGS.keys()).index(
+            st.session_state.active_commodity
+        ),
     )
 
-def apply_selection_sync(selected_key):
-    cfg = COMMODITY_CONFIGS[selected_key]
-    df_c, meta = extract_contracts_for_selection(df_master_cache, smart_api, cfg)
-    engine.switch_contracts(df_c, meta)
-    custom_strike_input.options = [f"{s:g}" for s in meta.get("available_strikes", [])]
+cfg = COMMODITY_CONFIGS[selected_comm]
 
-def on_commodity_change(change):
-    if change["type"] == "change" and change["name"] == "value":
-        selected_key = change["new"]
-        cfg = COMMODITY_CONFIGS[selected_key]
-        if not cfg["has_mini"]:
-            mode_dropdown.value = "Vertical Only (Same Contract)"
-            mode_dropdown.disabled = True
-            contract_scope_dropdown.value = "Mega Only"
-            contract_scope_dropdown.disabled = True
-        else:
-            mode_dropdown.disabled = False
-            contract_scope_dropdown.disabled = False
-        status_label.value = "<span style='background:#92400e; color:#fde68a; padding:5px 10px; border-radius:6px; font-weight:bold;'>⏳ LOADING CHAIN...</span>"
-        def _switch_worker():
-            apply_selection_sync(selected_key)
-            for sp in get_current_pinned():
-                parts = sp.split("|")
-                if parts[0] == "CROSS":
-                    engine.ensure_strike_loaded(float(parts[1]))
-                elif parts[0] == "VERT":
-                    engine.ensure_strike_loaded(float(parts[2]))
-                    engine.ensure_strike_loaded(float(parts[3]))
-            refresh_now()
-            status_label.value = (
-                "<span style='background:#065f46; color:#a7f3d0; padding:5px 10px; border-radius:6px; font-weight:bold;'>● AUTO-REFRESHING (1s)</span>"
-                if SCANNER_CONTROL["running"]
-                else "<span style='background:#991b1b; color:#fecaca; padding:5px 10px; border-radius:6px; font-weight:bold;'>■ STOPPED</span>"
-            )
-        threading.Thread(target=_switch_worker, daemon=True).start()
+if selected_comm != st.session_state.active_commodity:
+    with st.spinner(f"Loading {cfg['label']} option chain..."):
+        df_c, meta = extract_contracts_for_selection(
+            st.session_state.df_master_cache,
+            st.session_state.smart_api,
+            cfg,
+        )
+        engine.switch_contracts(df_c, meta)
+        st.session_state.active_commodity = selected_comm
+        for sp in st.session_state.pinned_by_commodity.get(selected_comm, []):
+            parts = sp.split("|")
+            if parts[0] == "CROSS":
+                engine.ensure_strike_loaded(float(parts[1]))
+            elif parts[0] == "VERT":
+                engine.ensure_strike_loaded(float(parts[2]))
+                engine.ensure_strike_loaded(float(parts[3]))
 
-def on_track_strike_clicked(b):
-    raw = str(custom_strike_input.value).strip()
-    if raw:
-        pin_item_programmatic(raw)
-        custom_strike_input.value = ""
+with c2:
+    mode_options = [
+        "Both (Cross + Vertical)",
+        "Vertical Only (Same Contract)",
+        "Cross-Contract Only (Mega vs Mini)",
+    ]
+    arb_mode = st.selectbox(
+        "Arb Mode",
+        options=mode_options,
+        index=0 if cfg["has_mini"] else 1,
+        disabled=not cfg["has_mini"],
+    )
 
-def on_clear_strikes_clicked(b):
-    SCANNER_CONTROL["pinned_by_commodity"][commodity_dropdown.value] = []
-    engine.peak_custom_spreads = {}
-    refresh_now()
+with c3:
+    scope_options = ["All (Mega + Mini)", "Mega Only", "Mini Only"]
+    contract_scope = st.selectbox(
+        "Contract",
+        options=scope_options,
+        index=0 if cfg["has_mini"] else 1,
+        disabled=not cfg["has_mini"],
+    )
 
-def on_filter_change(change):
-    if change["type"] == "change" and change["name"] == "value":
-        refresh_now()
+with c4:
+    min_spread = st.number_input(
+        "Min Spread (₹)", min_value=0.0, max_value=1000.0, value=0.0, step=0.05
+    )
 
-def on_start_clicked(b):
-    SCANNER_CONTROL["running"] = True
-    status_label.value = "<span style='background:#065f46; color:#a7f3d0; padding:5px 10px; border-radius:6px; font-weight:bold;'>● AUTO-REFRESHING (1s)</span>"
-    refresh_now()
+with c5:
+    st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+    include_quoted = st.checkbox("Quoted", value=True)
 
-def on_stop_clicked(b):
-    SCANNER_CONTROL["running"] = False
-    status_label.value = "<span style='background:#991b1b; color:#fecaca; padding:5px 10px; border-radius:6px; font-weight:bold;'>■ STOPPED (Click Start to Run)</span>"
-    refresh_now()
+# Top Control Row 2 (Pinning & Start/Stop)
+p1, p2, p3, p4, p5 = st.columns([2.2, 1.1, 1.1, 1.1, 1.0])
 
-commodity_dropdown.observe(on_commodity_change)
-mode_dropdown.observe(on_filter_change)
-contract_scope_dropdown.observe(on_filter_change)
-min_spread_input.observe(on_filter_change)
-include_quoted_chk.observe(on_filter_change)
-track_strike_btn.on_click(on_track_strike_clicked)
-clear_strikes_btn.on_click(on_clear_strikes_clicked)
-start_button.on_click(on_start_clicked)
-stop_button.on_click(on_stop_clicked)
+with p1:
+    strike_input = st.text_input(
+        "Track Strike (e.g., 9000 or 9000-9200)",
+        placeholder="9000 or 9000-9200",
+        label_visibility="collapsed",
+    )
 
-# Continuous background REST depth sync worker
-def continuous_depth_worker():
-    while SCANNER_CONTROL["alive"]:
-        if SCANNER_CONTROL["running"]:
-            try:
-                engine.sync_full_depth_snapshot()
-            except Exception:
-                pass
-        time.sleep(0.5)
+with p2:
+    if st.button("📌 Track Strike", use_container_width=True):
+        raw = str(strike_input).strip()
+        if raw:
+            cleaned = raw.replace("/", "-").replace(",", "-")
+            spec = None
+            strikes_to_load = []
+            if "-" in cleaned:
+                nums = [
+                    float(x.strip()) for x in cleaned.split("-") if x.strip()
+                ]
+                if (
+                    len(nums) == 2
+                    and nums[0] > 0
+                    and nums[1] > 0
+                    and abs(nums[0] - nums[1]) > 1e-4
+                ):
+                    spot = engine.fut_ltp
+                    cname = (
+                        engine.meta.get("mini")
+                        if (
+                            contract_scope == "Mini Only"
+                            and engine.meta.get("mini")
+                        )
+                        else engine.meta.get("mega", "")
+                    )
+                    if spot > 0 and nums[0] < spot and nums[1] < spot:
+                        opt_type = "PE"
+                        buy_k, sell_k = max(nums[0], nums[1]), min(
+                            nums[0], nums[1]
+                        )
+                    else:
+                        opt_type = "CE"
+                        buy_k, sell_k = min(nums[0], nums[1]), max(
+                            nums[0], nums[1]
+                        )
+                    spec = f"VERT|{cname}|{buy_k:g}|{sell_k:g}|{opt_type}"
+                    strikes_to_load = [buy_k, sell_k]
+            else:
+                try:
+                    val = float(cleaned)
+                    if val > 0:
+                        spec = f"CROSS|{val:g}"
+                        strikes_to_load = [val]
+                except Exception:
+                    pass
 
-threading.Thread(target=continuous_depth_worker, daemon=True).start()
+            if spec:
+                pinned = st.session_state.pinned_by_commodity.setdefault(
+                    selected_comm, []
+                )
+                if spec not in pinned:
+                    pinned.insert(0, spec)
+                    if len(pinned) > 10:
+                        pinned.pop()
+                for s_val in strikes_to_load:
+                    engine.ensure_strike_loaded(s_val)
 
-# Register browser callbacks for 1-second tick & 1-click row pinning
-def _on_browser_tick():
-    if SCANNER_CONTROL["alive"] and SCANNER_CONTROL["running"]:
-        refresh_now()
+with p3:
+    if st.button("🗑️ Clear Pinned", use_container_width=True):
+        st.session_state.pinned_by_commodity[selected_comm] = []
+        engine.peak_custom_spreads = {}
 
-output.register_callback("notebook.arb_live_tick", _on_browser_tick)
-output.register_callback("notebook.pin_item_cb", pin_item_programmatic)
-output.register_callback("notebook.unpin_item_cb", unpin_item_programmatic)
+with p4:
+    if st.button("▶️ Start", use_container_width=True):
+        st.session_state.running = True
+        engine.running = True
 
-# Initial load & immediate render
-apply_selection_sync(commodity_dropdown.value)
-refresh_now()
+with p5:
+    if st.button("⏹️ Stop", use_container_width=True):
+        st.session_state.running = False
+        engine.running = False
 
-row_1 = widgets.HBox([commodity_dropdown, mode_dropdown, contract_scope_dropdown, min_spread_input, include_quoted_chk], layout=widgets.Layout(align_items='center', gap='8px', flex_wrap='wrap'))
-row_2 = widgets.HBox([custom_strike_input, track_strike_btn, clear_strikes_btn, start_button, stop_button, status_label], layout=widgets.Layout(align_items='center', gap='8px', margin='6px 0 10px 0', flex_wrap='wrap'))
-display(widgets.VBox([row_1, row_2, dashboard_widget]))
 
-# Start clean 1-second interval timer in browser
-display(Javascript("""
-if (window.arbTickerInterval) {
-    clearInterval(window.arbTickerInterval);
-}
-window.arbTickerInterval = setInterval(function() {
-    if (typeof google !== 'undefined' && google.colab && google.colab.kernel) {
-        google.colab.kernel.invokeFunction('notebook.arb_live_tick', [], {});
-    }
-}, 1000);
-"""))
+# Live 1-Second Auto-Refreshing Terminal Fragment
+@st.fragment(run_every=1)
+def render_live_terminal():
+    if st.session_state.running:
+        st.session_state.scan_count += 1
+
+    pinned_list = st.session_state.pinned_by_commodity.get(selected_comm, [])
+    html_out = build_full_terminal_html(
+        engine=engine,
+        min_spread=min_spread,
+        include_quoted=include_quoted,
+        active_mode=arb_mode,
+        contract_scope=contract_scope,
+        pinned_specs=pinned_list,
+        scan_count=st.session_state.scan_count,
+        is_running=st.session_state.running,
+    )
+    st.markdown(html_out, unsafe_allow_html=True)
+
+
+render_live_terminal()
