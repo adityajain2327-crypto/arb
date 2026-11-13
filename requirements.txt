@@ -5,5 +5,5 @@ pandas
 numpy
 logzero
 websocket-client
-ipywidgets
+
 streamlit
