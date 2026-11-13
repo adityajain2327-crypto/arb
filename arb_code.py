@@ -1,5 +1,5 @@
 ﻿# Install required libraries
-!pip install -q smartapi-python pyotp requests pandas numpy logzero websocket-client ipywidgets
+
 
 import time
 import logging
